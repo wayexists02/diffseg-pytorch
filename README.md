@@ -1,6 +1,6 @@
 # DiffSeg-pytorch
 
-Unofficial implementation of DiffSeg ("Diffuse attend and segment: Unsupervised zero-shot segmentation using stable diffusion." [1]) using PyTorch.
+Unofficial implementation of DiffSeg ("Diffuse attend and segment: Unsupervised zero-shot segmentation using stable diffusion." [1]) using PyTorch. This repo is for practice.
 
 The original repo is [here](https://github.com/google/diffseg).
 
