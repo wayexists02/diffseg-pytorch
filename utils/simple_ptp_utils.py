@@ -26,16 +26,25 @@ class SimpleAttentionProcessor():
         value = attn.head_to_batch_dim(value)
 
         attention_probs = attn.get_attention_scores(query, key, attention_mask)
-
         attention_probs_cpu = attention_probs.half().cpu()
-        attention_probs_cpu = einops.rearrange(
-            attention_probs_cpu, 
-            "(b hd) (h1 w1) (h2 w2) -> b hd h1 w1 h2 w2", 
-            b=batch_size,
-            h1=int(attention_probs_cpu.size(-2) ** 0.5),
-            h2=int(attention_probs_cpu.size(-1) ** 0.5)
-        )
-        self.attention_store(attention_probs_cpu, is_cross, self.place_in_unet)
+        
+        if is_cross:
+            attention_probs_cpu = einops.rearrange(
+                attention_probs_cpu, 
+                "(b hd) (h1 w1) l -> b hd h1 w1 l", 
+                b=batch_size,
+                h1=int(attention_probs_cpu.size(-2) ** 0.5),
+            )
+            self.attention_store(attention_probs_cpu, is_cross, self.place_in_unet)
+        else:
+            attention_probs_cpu = einops.rearrange(
+                attention_probs_cpu, 
+                "(b hd) (h1 w1) (h2 w2) -> b hd h1 w1 h2 w2", 
+                b=batch_size,
+                h1=int(attention_probs_cpu.size(-2) ** 0.5),
+                h2=int(attention_probs_cpu.size(-1) ** 0.5)
+            )
+            self.attention_store(attention_probs_cpu, is_cross, self.place_in_unet)
 
         hidden_states = torch.bmm(attention_probs, value)
         hidden_states = attn.batch_to_head_dim(hidden_states)
@@ -67,16 +76,27 @@ class SimpleAttentionStore():
         key = f"{place_in_unet}_{'cross' if is_cross else 'self'}"
         self.store[key].append(attention_score)
         return attention_score
-
-    def to_dict(self):
-        return self.store
+    
+    def get_self_attention_maps(self):
+        self_attention_maps = []
+        for key in self.store.keys():
+            if "self" in key:
+                self_attention_maps.extend(self.store[key])
+        return self_attention_maps
+    
+    def get_cross_attention_maps(self):
+        cross_attention_maps = []
+        for key in self.store.keys():
+            if "cross" in key:
+                cross_attention_maps.extend(self.store[key])
+        return cross_attention_maps
 
 
 def set_attention_processors(pipe, attention_store):
     attn_processors = pipe.unet.attn_processors
 
     for key in attn_processors.keys():
-        if "up_blocks" in key and "attn1" in key:
+        if "up_blocks" in key:
             attn_processors[key] = SimpleAttentionProcessor(attention_store, "up")
 
     pipe.unet.set_attn_processor(attn_processors)
