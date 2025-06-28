@@ -8,6 +8,19 @@ from skimage.filters import threshold_otsu
 
 @torch.inference_mode()
 def diffseg_aggregate_self_attention_map(self_attention_maps, device=torch.device("cpu"), dtype=torch.float32):
+    """
+    Aggregate self attention maps by taking self attention maps from multiple layers of diffusion models.
+
+    Arguments:
+    - self_attention_maps: list of self attention tensors whose shape are (b, heads, h1, w1, h2, w2).
+                           Each tensor represents a self attention maps of a specific layer of diffusion models
+    - device: torch device
+    - dtype: torch dtype
+
+    Returns:
+    - aggregated_self_attention_map: aggregated self attention map (b, h1, w1, h2, w2)
+    """
+
     self_attention_maps = [am.mean(dim=1).to(device, dtype) for am in self_attention_maps]
     self_attention_map_sizes = list(map(lambda map: map.size()[-1], self_attention_maps))
     self_attention_map_sizes = np.unique(self_attention_map_sizes)
@@ -44,6 +57,25 @@ def diffseg_aggregate_self_attention_map(self_attention_maps, device=torch.devic
 
 @torch.inference_mode()
 def diffseg_aggregate_cross_attention_map(cross_attention_maps, attn_token_indices, device=torch.device("cpu"), dtype=torch.float32):
+    """
+    Aggregate cross attention maps extracted from multiple layers of diffusion models.
+
+    Arguments:
+    - cross_attention_maps: list of cross attention tensors whose shape are (b, heads, h1, w1, l),
+                            where l denotes the number of tokens (l=77)
+                            Each element of the list represents a cross attention map of a specific layer in diffusion models
+    - attn_token_indices: list of token indices, such as [list_of_token_indices_of_object1, list_of_token_indices_of_object2, ...]
+                          For instance, given a prompt "a pomeranian standing on a lush green field",
+                          attn_token_indices can be [[2, 3], [8, 9]], where [2, 3] is index list of "pomeranian" (pomeranian is encoded as 2 words by diffusion tokenizer)
+                          and [8, 9] denotes index list of "green field". Note that index 0 is the start-of-sentence token.
+    - device: torch device
+    - dtype: torch dtype
+
+    Returns:
+    - aggregated_cross_attention_map: aggregated cross attention map, shape of (b, h1, w1, len(attn_token_indices)), where len(attn_token_indices) represents the number of interested objects.
+    - aggregated_cross_attention_mask: cross attention mask computed from aggregated_cross_attention_map by applying otsu thresholding. (b, h1, w1, len(attn_token_indices))
+    """
+
     indices = []
     for i in attn_token_indices:
         indices.extend(i)
@@ -91,12 +123,14 @@ def diffseg_aggregate_cross_attention_map(cross_attention_maps, attn_token_indic
 @torch.inference_mode()
 def diffseg_compute_attention_distance(attention_map1, attention_map2):
     """
+    Compute KL distance between all pairs of attention map1 and attention map2. (eq. 5 in the paper)
+
     Arguments:
-    - attention_map1: (n h w)
-    - attention_map2: (m h w)
+    - attention_map1: (m h w). m spatial attention maps. Each attention map should have shape (h, w).
+    - attention_map2: (n h w). n spatial attention maps. Each attention map should have shape (h, w).
 
     Returns:
-    - D: pairwise KL distance between all pairs of attention maps from attention_map1 and attention_map2
+    - D: (m, n). pairwise KL distance between all pairs of attention maps from attention_map1 and attention_map2.
     """
 
     log_p = attention_map1.log().flatten(1)
@@ -114,6 +148,8 @@ def diffseg_compute_attention_distance(attention_map1, attention_map2):
 @torch.inference_mode()
 def diffseg_initialize_anchor_grid(anchor_grid_size: Iterable[int]):
     """
+    get initial anchor points for obtaining initial proposals
+
     Arguments:
     - anchor_grid_size: tuple of int (height, width)
 
@@ -121,7 +157,6 @@ def diffseg_initialize_anchor_grid(anchor_grid_size: Iterable[int]):
     - anchor_grid: coordinates of each anchor point (1, height_of_anchor_grid, width_of_anchor_grid, 2)
     """
 
-    # assume align_corners=True when grid sampling (coordinates of each corner point is [-1, -1], [-1, 1], [1, -1], [1, 1])
     anchor_x_coords = torch.linspace(-1, 1, steps=anchor_grid_size[1]*2 + 1)
     anchor_x_coords = anchor_x_coords[1:-1:2][None, :].expand(*anchor_grid_size)
     anchor_y_coords = torch.linspace(-1, 1, steps=anchor_grid_size[0]*2 + 1)
@@ -135,6 +170,23 @@ def run_diffseg_first_iter(anchor_grid: torch.Tensor,
                            aggregated_self_attention_map: torch.Tensor, 
                            tau: float,
                            batch_size: int = 32):
+    """
+    First iteration of DiffSeg.
+
+    Refine the proposals by aggregating similar self attention maps
+
+    Arguments:    
+    - anchor_grid: (1, height_of_anchor_grid, width_of_anchor_grid, 2). grid for sampling initial proposals
+    - aggregated_self_attention_map: (b, h1, w1, h2, w2). aggregated self attention map by diffseg_aggregate_self_attention_map.
+    - tau: KL distance threshold for determining if two attention maps are similar.
+    - batch_size: batch_size for computing attention distance. In the first iteration, 
+                  since the computational cost of simultaneously computing KL distance between all pairs of ths proposals and the attention maps is very high,
+                  we divide the computation into batches.
+
+    Returns:
+    - new_seg_proposals: list of refined proposals. Each proposal has shape of (num_of_proposals, h2, w2).
+                         Length of this list is the same as the number of sample (=len(aggregated_self_attention_map)).
+    """
     
     N, H1, W1, H2, W2 = aggregated_self_attention_map.size()
     aggregated_self_attention_map = einops.rearrange(
@@ -187,9 +239,16 @@ def run_diffseg_first_iter(anchor_grid: torch.Tensor,
 @torch.inference_mode()
 def run_diffseg_post_iter(seg_proposals, tau):
     """
+    Rest iteration of DiffSeg.
+    Refine the proposals by merging similar proposals
+
     Arguments:
-    - seg_proposals: (b, n_proposals, h2, w2)
+    - seg_proposals: list of proposals of shape (n_proposals, h2, w2).
     - tau: float (distance threshold)
+
+    Returns:
+    - new_seg_proposals: list of refined proposals of shape (n_proposals, h2, w2).
+                         n_proposals is less than or equal to the number of proposals in seg_proposals
     """
 
     N = len(seg_proposals)
@@ -224,8 +283,25 @@ def run_diffseg(self_attention_maps: List[torch.Tensor],
                 attn_token_indices: Optional[List[int]] = None,
                 add_semantic: bool = False):
     """
+    run DiffSeg.
+
     Arguments:
-    - self_attention_maps: list of self attention map with various spatial size
+    - self_attention_maps: list of self attention map from multiple layers of diffusion models.
+    - cross_attention_maps: list of cross attention map from multiple layers of diffusion models.
+    - anchor_grid_size: tuple of height and width of anchor grid.
+    - target_size: desirable height and width of final segmentation map.
+    - tau: float (distance threshold)
+    - n_iters: the number of iterations of DiffSeg iterations. 1 + the_number_of_iterations_of_post_iter
+    - batch_size: The batch size used in computing KL distance. THIS IS NOT the batch size of inputs of diffusion models.
+    - device: torch device
+    - dtype: torch dtype
+    - attn_token_indices: list of token indices, such as [list_of_token_indices_of_object1, list_of_token_indices_of_object2, ...]
+                          For instance, given a prompt "a pomeranian standing on a lush green field",
+                          attn_token_indices can be [[2, 3], [8, 9]], where [2, 3] is index list of "pomeranian" (pomeranian is encoded as 2 words by diffusion tokenizer)
+                          and [8, 9] denotes index list of "green field". Note that index 0 is the start-of-sentence token.
+                          If add_semantic is set True, this argument is required.
+    - add_semantic: bool. whether to add semantic information to the segmentation map.
+                    If this is set to True, attn_token_indices is required.
     """
 
     aggregated_self_attention_map = diffseg_aggregate_self_attention_map(self_attention_maps, device, dtype)
@@ -237,6 +313,8 @@ def run_diffseg(self_attention_maps: List[torch.Tensor],
     for i in range(n_iters - 1):
         seg_proposals = run_diffseg_post_iter(seg_proposals, tau)
 
+    # add_semantic: this is not the implementation of the DiffSeg paper.
+    # This code will be fixed later.
     if add_semantic is True:
         _, aggregated_cross_attention_mask = diffseg_aggregate_cross_attention_map(cross_attention_maps, attn_token_indices, device, dtype)
         B, H, W, L = aggregated_cross_attention_mask.size()
