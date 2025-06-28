@@ -89,21 +89,24 @@ def diffseg_aggregate_cross_attention_map(cross_attention_maps, attn_token_indic
 
 
 @torch.inference_mode()
-def diffseg_compute_attention_distance(attention_map1: torch.Tensor, attention_map2: torch.Tensor):
+def diffseg_compute_attention_distance(attention_map1, attention_map2):
     """
     Arguments:
     - attention_map1: (n h w)
     - attention_map2: (m h w)
 
     Returns:
-    - D: (n, m) pairwise KL distance between all pairs of attention maps from attention_map1 and attention_map2
+    - D: pairwise KL distance between all pairs of attention maps from attention_map1 and attention_map2
     """
 
-    log_attention_map1 = attention_map1.log()
-    log_attention_map2 = attention_map2.log()
+    log_p = attention_map1.log().flatten(1)
+    log_q = attention_map2.log().flatten(1)
 
-    forward_kl = torch.sum(attention_map1[:, None] * (log_attention_map1[:, None] - log_attention_map2[None]), dim=(-1, -2))
-    reverse_kl = torch.sum(attention_map2[None] * (log_attention_map2[None] - log_attention_map1[:, None]), dim=(-1, -2))
+    p = attention_map1.flatten(1)
+    q = attention_map2.flatten(1)
+
+    forward_kl = torch.sum(p * log_p, dim=-1, keepdim=True) - p @ log_q.t()
+    reverse_kl = torch.sum(q * log_q, dim=-1, keepdim=True).t() - (q @ log_p.t()).t()
     D = (forward_kl + reverse_kl)/2
     return D
 
