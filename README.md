@@ -6,7 +6,7 @@ The original repo is [here](https://github.com/google/diffseg).
 
 ![](resources/outputs.png)
 
-The images are from OpenImage dataset [4]. The experiment code is in [diffseg_pytorch_exp.ipynb](diffseg_pytorch_exp.ipynb).
+The images are from OpenImage dataset [4]. The experiment code is in [diffseg_pytorch_exp.ipynb](diffseg_pytorch_exp.ipynb). Note that the darker color represents the lower index of semantic labels.
 
 # References
 [1] Tian, J., Aggarwal, L., Colaco, A., Kira, Z., & Gonzalez-Franco, M. (2024). Diffuse attend and segment: Unsupervised zero-shot segmentation using stable diffusion. In Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition (pp. 3554-3563).<br/>
