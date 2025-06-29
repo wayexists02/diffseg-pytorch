@@ -108,16 +108,8 @@ def diffseg_aggregate_cross_attention_map(cross_attention_maps, attn_token_indic
     aggregated_cross_attention_map /= R_sum
     aggregated_cross_attention_map = aggregated_cross_attention_map.split([len(ind) for ind in attn_token_indices], dim=-1)
     aggregated_cross_attention_map = torch.stack([acam.mean(dim=-1) for acam in aggregated_cross_attention_map], dim=-1)
-
-    aggregated_cross_attention_map = einops.rearrange(aggregated_cross_attention_map, "b h w l -> (b l) h w")
-    aggregated_cross_attention_map_np = aggregated_cross_attention_map.float().cpu().numpy()
-    ths = list(map(lambda i: threshold_otsu(aggregated_cross_attention_map_np[i]), range(len(aggregated_cross_attention_map))))
-    ths = torch.tensor(ths, device=aggregated_cross_attention_map.device)[:, None, None]
-
-    aggregated_cross_attention_mask = (aggregated_cross_attention_map >= ths).type(aggregated_cross_attention_map.dtype)
-    aggregated_cross_attention_mask = einops.rearrange(aggregated_cross_attention_mask, "(b l) h w -> b h w l", l=len(attn_token_indices))
-    aggregated_cross_attention_map = einops.rearrange(aggregated_cross_attention_map, "(b l) h w -> b h w l", l=len(attn_token_indices))
-    return aggregated_cross_attention_map, aggregated_cross_attention_mask
+    aggregated_cross_attention_map = aggregated_cross_attention_map / aggregated_cross_attention_map.sum(dim=(1, 2))
+    return aggregated_cross_attention_map
 
 
 @torch.inference_mode()
@@ -274,7 +266,7 @@ def run_diffseg_post_iter(seg_proposals, tau):
 def run_diffseg(self_attention_maps: List[torch.Tensor],
                 cross_attention_maps: List[torch.Tensor],
                 anchor_grid_size: Iterable[int] = (16, 16), 
-                target_size: Iterable[int] = (92, 92), 
+                target_size: Iterable[int] = (96, 96), 
                 tau: float = 1.0, 
                 n_iters: int = 10,
                 batch_size: int = 32,
@@ -313,28 +305,40 @@ def run_diffseg(self_attention_maps: List[torch.Tensor],
     for i in range(n_iters - 1):
         seg_proposals = run_diffseg_post_iter(seg_proposals, tau)
 
+    seg_proposals = [F.interpolate(seg_proposals[i][None], size=(96, 96), mode="bilinear", align_corners=False)[0] for i in range(len(seg_proposals))]
+    seg_proposals = torch.stack([seg_proposals[i].argmax(dim=0) for i in range(len(seg_proposals))])
+
     # add_semantic: this is not the implementation of the DiffSeg paper.
     # This code will be fixed later.
     if add_semantic is True:
-        _, aggregated_cross_attention_mask = diffseg_aggregate_cross_attention_map(cross_attention_maps, attn_token_indices, device, dtype)
-        B, H, W, L = aggregated_cross_attention_mask.size()
+        aggregated_cross_attention_map = diffseg_aggregate_cross_attention_map(cross_attention_maps, attn_token_indices, device, dtype)
+        aggregated_cross_attention_map = aggregated_cross_attention_map.permute(0, 3, 1, 2)
+        aggregated_cross_attention_map = F.interpolate(aggregated_cross_attention_map, size=(96, 96), mode="nearest")
+        aggregated_cross_attention_map = aggregated_cross_attention_map.permute(0, 2, 3, 1)
 
-        bg_mask = (aggregated_cross_attention_mask.sum(dim=-1) < 0.5).type(aggregated_cross_attention_mask.dtype)
-        aggregated_cross_attention_mask_oh = torch.cat([
-            bg_mask.unsqueeze(-1), aggregated_cross_attention_mask
-        ], dim=-1)
-
-        seg_proposals_with_segmentic = []
+        B, H, W, L = aggregated_cross_attention_map.size()
+        seg_proposals_with_semantic = []
+        semantic = []
 
         for i in range(len(seg_proposals)):
-            seg_proposals_i = seg_proposals[i] # (num_proposals, h, w)
-            semantic = seg_proposals_i.flatten(-2, -1).mm(aggregated_cross_attention_mask_oh[i].flatten(0, 1)).argmax(dim=-1) # majority voting (num_seg_proposals,)
-            seg_proposals_with_segmentic_i = [seg_proposals_i[semantic == 0]] + [seg_proposals_i[semantic == s].sum(dim=0, keepdim=True) for s in range(1, len(attn_token_indices) + 1)]
-            seg_proposals_with_segmentic_i = torch.cat(seg_proposals_with_segmentic_i)
-            seg_proposals_with_segmentic.append(seg_proposals_with_segmentic_i)
+            seg_proposals_i = seg_proposals[i] # (h, w)
+            num_proposals = seg_proposals_i.max() + 1
 
-        seg_proposals = seg_proposals_with_segmentic
+            seg_proposals_i_oh = F.one_hot(seg_proposals_i, num_classes=num_proposals).permute(2, 0, 1)
+            seg_proposals_i_flatten = seg_proposals_i_oh.flatten(1).type(aggregated_cross_attention_map.dtype) # (num_proposals, h*w)
+            aggregated_cross_attention_map_i = aggregated_cross_attention_map[i].flatten(0, 1) # (h*w, l)
 
-    seg_proposals = [F.interpolate(seg_proposals[i][None], size=target_size, mode="bilinear", align_corners=False)[0] for i in range(len(seg_proposals))]
-    seg_proposals = torch.stack([seg_proposals[i].argmax(dim=0) for i in range(len(seg_proposals))])
+            pred_vector_i = seg_proposals_i_flatten @ aggregated_cross_attention_map_i # (num_proposals, l)
+            semantic_i = torch.argmax(pred_vector_i, dim=-1) # (num_proposals,)
+            seg_proposals_with_semantic_i = torch.stack([(seg_proposals_i_oh[semantic_i == l].sum(dim=0) > 0.5).type(seg_proposals_i.dtype) for l in range(L)])
+
+            seg_proposals_with_semantic_i = seg_proposals_with_semantic_i.argmax(dim=0)
+            semantic_i = torch.arange(L).to(semantic_i.device, semantic_i.dtype)
+
+            seg_proposals_with_semantic.append(seg_proposals_with_semantic_i)
+            semantic.append(semantic_i)
+
+        seg_proposals_with_semantic = torch.stack(seg_proposals_with_semantic)
+        seg_proposals = seg_proposals_with_semantic
+
     return seg_proposals
